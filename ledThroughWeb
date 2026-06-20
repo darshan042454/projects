@@ -1,0 +1,232 @@
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+
+WebServer server(80);
+WebSocketsServer webSocket(81);   // WebSocket runs on its own port
+
+const char* ssid = "wifiname ";
+const char* password = "password";
+
+const int LED_PIN = 2;
+const int ge = 12, whi = 32, blue = 33, red = 26;
+
+bool ledState[4] = {false, false, false, false};
+int leds[4] = {red, blue, whi, ge};
+String ledNames[4] = {"RED", "BLUE", "WHITE", "GREEN"};
+const char* colors[4] = {"#E24B4A", "#378ADD", "#D3D1C7", "#639922"};
+
+void broadcastState() {
+    String json = "{\"states\":[";
+    for (int i = 0; i < 4; i++) {
+        json += ledState[i] ? "true" : "false";
+        if (i < 3) json += ",";
+    }
+    json += "]}";
+    webSocket.broadcastTXT(json);
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            Serial.printf("[WS %u] Disconnected\n", num);
+            break;
+
+        case WStype_CONNECTED: {
+            IPAddress ip = webSocket.remoteIP(num);
+            Serial.printf("[WS %u] Connected from %s\n", num, ip.toString().c_str());
+            broadcastState();   // send current state to the newly connected client
+            break;
+        }
+
+        case WStype_TEXT: {
+            // payload is NOT guaranteed null-terminated -> copy safely
+            char buf[16] = {0};
+            size_t n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
+            memcpy(buf, payload, n);
+            buf[n] = '\0';
+
+            int ledNum = atoi(buf);
+            Serial.printf("[WS %u] Toggle request for LED %d\n", num, ledNum);
+
+            if (ledNum >= 0 && ledNum < 4) {
+                ledState[ledNum] = !ledState[ledNum];
+                digitalWrite(leds[ledNum], ledState[ledNum]);
+                broadcastState();
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void handleRoot() {
+    server.send(200, "text/plain", "Home Page");
+}
+
+void handleMotor() {
+    server.send(200, "text/plain", "Motor Page");
+}
+
+void handleTemperature() {
+    server.send(200, "text/plain", "Temperature Page");
+}
+
+void handleLed() {
+    String page = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+<title>ESP32 LED Panel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{background:#0b1f17;font-family:monospace;color:#F1EFE8;margin:0;padding:24px;}
+h1{font-size:14px;letter-spacing:2px;color:#5DCAA5;margin-bottom:6px;}
+.status{font-size:11px;color:#888;margin-bottom:20px;}
+.row{display:flex;align-items:center;gap:14px;background:#0f2a1f;border:1px solid #1a3d2c;
+     border-radius:8px;padding:12px 16px;margin-bottom:12px;}
+.bulb{width:34px;height:34px;border-radius:6px;border:1px solid #2a4a38;
+      display:flex;align-items:center;justify-content:center;background:#0b1f17;font-size:18px;}
+.label{flex:1;font-size:14px;}
+.pin{color:#5DCAA5;opacity:.6;font-size:11px;}
+.sw{width:46px;height:24px;border-radius:12px;border:1px solid #2a4a38;background:#1a3d2c;
+    position:relative;cursor:pointer;transition:background .2s;}
+.sw.on{background:#0f4530;border-color:#5DCAA5;}
+.knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;
+      background:#5f5e5a;transition:left .2s, background .2s;}
+.on .knob{left:24px;}
+</style>
+</head>
+<body>
+<h1>ESP32 // GPIO PANEL</h1>
+<div class="status" id="status">connecting...</div>
+<div id="rows"></div>
+<script>
+const meta = LED_META;
+let states = STATES;
+let ws;
+
+function connect(){
+  const url = 'ws://' + location.hostname + ':81/';
+  document.getElementById('status').textContent = 'connecting to ' + url;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    document.getElementById('status').textContent = 'connected - live sync active';
+  };
+  ws.onclose = () => {
+    document.getElementById('status').textContent = 'disconnected, retrying...';
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = (e) => {
+    document.getElementById('status').textContent = 'connection error, retrying...';
+  };
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    states = data.states;
+    render();
+  };
+}
+
+function render(){
+  const rows = document.getElementById('rows');
+  rows.innerHTML = '';
+  meta.forEach((l,i)=>{
+    const on = states[i];
+    rows.innerHTML += `
+    <div class="row">
+      <div class="bulb" style="color:${on?l.color:'#444'}">&#9679;</div>
+      <div class="label">${l.name}<div class="pin">GPIO ${l.pin}</div></div>
+      <div class="sw ${on?'on':''}" onclick="toggle(${i})"><div class="knob"></div></div>
+    </div>`;
+  });
+}
+
+function toggle(i){
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(String(i));
+  }
+}
+
+render();
+connect();
+</script>
+</body>
+</html>
+)=====";
+
+    String meta = "[";
+    for (int i = 0; i < 4; i++) {
+        meta += "{name:'" + ledNames[i] + "',pin:" + String(leds[i]) + ",color:'" + colors[i] + "'}";
+        if (i < 3) meta += ",";
+    }
+    meta += "]";
+    page.replace("LED_META", meta);
+
+    String states = "[";
+    for (int i = 0; i < 4; i++) {
+        states += ledState[i] ? "true" : "false";
+        if (i < 3) states += ",";
+    }
+    states += "]";
+    page.replace("STATES", states);
+
+    server.send(200, "text/html", page);
+}
+
+void handleNotFound() {
+    server.send(404, "text/plain", "Page Not Found");
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(ge, OUTPUT);
+    pinMode(whi, OUTPUT);
+    pinMode(blue, OUTPUT);
+    pinMode(red, OUTPUT);
+
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi Connected");
+    Serial.print("ESP32 IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    ArduinoOTA.begin();
+    Serial.println("OTA ready");
+
+    server.on("/", handleRoot);
+    server.on("/motor", handleMotor);
+    server.on("/temperature", handleTemperature);
+    server.on("/led", handleLed);
+    server.onNotFound(handleNotFound);
+    server.begin();
+    Serial.println("HTTP server started on port 80");
+
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+    Serial.println("WebSocket server started on port 81");
+
+    Serial.println("---------------------------------");
+    Serial.print("Open: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/led");
+    Serial.println("---------------------------------");
+}
+
+void loop() {
+    ArduinoOTA.handle();
+    server.handleClient();
+    webSocket.loop();
+}
